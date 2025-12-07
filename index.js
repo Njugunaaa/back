@@ -1,207 +1,215 @@
 import express from "express";
-import multer from "multer";
 import cors from "cors";
-import fetch from "node-fetch";
+import axios from "axios";
+import dotenv from "dotenv";
 import { v2 as cloudinary } from "cloudinary";
+
+dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "15mb" })); // supports image uploads
 
-// --------------------------
-// CONFIG
-// --------------------------
-const JSONBIN_MASTER_KEY = "$2a$10$xSp4u1Y3iLb5bmRCQyG4WOtKRJELsKS3BAzd7O72PJcpOhtlNVrji";
-
-const EVENTS_BIN = "6934b021ae596e708f882d96";
-const SERMONS_BIN = "6934b00643b1c97be9dc6e37";
-
+// Cloudinary config
 cloudinary.config({
-  cloud_name: "dgzyfeumy",
-  api_key: "864314542448916",
-  api_secret: "GcWRtYUdPXxcjNILw89oiUG09Zo"
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// Multer for file uploads
-const storage = multer.memoryStorage();
-const upload = multer({ storage });
+// JSONBin config
+const JSONBIN_KEY = process.env.JSONBIN_MASTER_KEY;
+const EVENTS_BIN = process.env.EVENTS_BIN;
+const SERMONS_BIN = process.env.SERMONS_BIN;
 
-// --------------------------
-// HELPERS
-// --------------------------
+const BIN_URL = (bin) => `https://api.jsonbin.io/v3/b/${bin}`;
 
-async function getBin(binId) {
-  const res = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
-    method: "GET",
-    headers: {
-      "X-Master-Key": JSONBIN_MASTER_KEY
+// -----------------------------------------------------
+// Helper: fetch bin
+// -----------------------------------------------------
+async function loadBin(binId) {
+  const res = await axios.get(BIN_URL(binId), {
+    headers: { "X-Master-Key": JSONBIN_KEY }
+  });
+  return res.data.record || [];
+}
+
+// -----------------------------------------------------
+// Helper: overwrite bin
+// -----------------------------------------------------
+async function saveBin(binId, data) {
+  await axios.put(
+    BIN_URL(binId),
+    data,
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Master-Key": JSONBIN_KEY
+      }
     }
-  });
-  const data = await res.json();
-  return data.record;
+  );
 }
 
-async function updateBin(binId, newData) {
-  await fetch(`https://api.jsonbin.io/v3/b/${binId}`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Master-Key": JSONBIN_MASTER_KEY
-    },
-    body: JSON.stringify(newData)
+// -----------------------------------------------------
+// Cloudinary upload helper
+// -----------------------------------------------------
+async function uploadImage(base64) {
+  const upload = await cloudinary.uploader.upload(base64, {
+    folder: "events_uploads",
+    resource_type: "image"
   });
+
+  return upload.secure_url;
 }
 
-// --------------------------
-// CLOUDINARY UPLOADER
-// --------------------------
+// -----------------------------------------------------
+// EVENTS ENDPOINTS
+// -----------------------------------------------------
 
-async function uploadToCloudinary(fileBuffer) {
-  return await new Promise((resolve, reject) => {
-    cloudinary.uploader.upload_stream({ folder: "events" }, (err, result) => {
-      if (err) return reject(err);
-      resolve(result.secure_url);
-    }).end(fileBuffer);
-  });
-}
-
-// --------------------------
-// EVENTS ROUTES
-// --------------------------
-
-// GET ALL EVENTS
-app.get("/events", async (req, res) => {
-  const data = await getBin(EVENTS_BIN);
-  res.json(data.events || []);
+// Fetch all events
+app.get("/api/events", async (req, res) => {
+  try {
+    const events = await loadBin(EVENTS_BIN);
+    res.json(events);
+  } catch (err) {
+    res.status(500).json({ error: "Error loading events" });
+  }
 });
 
-// CREATE EVENT
-app.post("/events", upload.single("image"), async (req, res) => {
+// Create event
+app.post("/api/events", async (req, res) => {
   try {
-    const data = await getBin(EVENTS_BIN);
+    const { title, date, content, image } = req.body;
 
-    let imageUrl = null;
+    let imageUrl = image;
 
-    if (req.file) imageUrl = await uploadToCloudinary(req.file.buffer);
+    if (image && image.startsWith("data:")) {
+      imageUrl = await uploadImage(image);
+    }
+
+    const events = await loadBin(EVENTS_BIN);
 
     const newEvent = {
       id: Date.now().toString(),
-      title: req.body.title,
-      description: req.body.description,
-      date: req.body.date,
-      image_path: imageUrl,
-      created_at: new Date().toISOString()
+      title,
+      date,
+      content,
+      image: imageUrl
     };
 
-    data.events.push(newEvent);
+    events.push(newEvent);
+    await saveBin(EVENTS_BIN, events);
 
-    await updateBin(EVENTS_BIN, data);
-
-    res.json({ success: true, event: newEvent });
-
+    res.json(newEvent);
   } catch (err) {
-    res.status(500).json({ error: "Failed to save event", details: err.message });
+    res.status(500).json({ error: "Failed to save event" });
   }
 });
 
-// EDIT EVENT
-app.put("/events/:id", upload.single("image"), async (req, res) => {
+// Edit event
+app.put("/api/events/:id", async (req, res) => {
   try {
-    const data = await getBin(EVENTS_BIN);
-
+    const events = await loadBin(EVENTS_BIN);
     const id = req.params.id;
-    let event = data.events.find(ev => ev.id === id);
-    if (!event) return res.status(404).json({ error: "Event not found" });
 
-    let imageUrl = event.image_path;
+    let imageUrl = req.body.image;
+    if (req.body.image && req.body.image.startsWith("data:")) {
+      imageUrl = await uploadImage(req.body.image);
+    }
 
-    // If image replaced
-    if (req.file) imageUrl = await uploadToCloudinary(req.file.buffer);
+    const updated = events.map(ev =>
+      ev.id === id ? { ...ev, ...req.body, image: imageUrl } : ev
+    );
 
-    event.title = req.body.title;
-    event.description = req.body.description;
-    event.date = req.body.date;
-    event.image_path = imageUrl;
+    await saveBin(EVENTS_BIN, updated);
 
-    await updateBin(EVENTS_BIN, data);
-
-    res.json({ success: true, event });
-
+    res.json({ message: "Event updated" });
   } catch (err) {
-    res.status(500).json({ error: "Failed to update event", details: err.message });
+    res.status(500).json({ error: "Failed to update event" });
   }
 });
 
-// DELETE EVENT
-app.delete("/events/:id", async (req, res) => {
-  const data = await getBin(EVENTS_BIN);
-
-  data.events = data.events.filter(ev => ev.id !== req.params.id);
-
-  await updateBin(EVENTS_BIN, data);
-
-  res.json({ success: true });
-});
-
-// --------------------------
-// SERMONS ROUTES
-// --------------------------
-
-app.get("/sermons", async (req, res) => {
-  const data = await getBin(SERMONS_BIN);
-  res.json(data.sermons || []);
-});
-
-app.post("/sermons", async (req, res) => {
+// Delete event
+app.delete("/api/events/:id", async (req, res) => {
   try {
-    const data = await getBin(SERMONS_BIN);
+    const events = await loadBin(EVENTS_BIN);
+    const filtered = events.filter(ev => ev.id !== req.params.id);
+    await saveBin(EVENTS_BIN, filtered);
+    res.json({ message: "Event deleted" });
+  } catch {
+    res.status(500).json({ error: "Failed to delete event" });
+  }
+});
+
+// -----------------------------------------------------
+// SERMONS ENDPOINTS
+// -----------------------------------------------------
+
+app.get("/api/sermons", async (req, res) => {
+  try {
+    const sermons = await loadBin(SERMONS_BIN);
+    res.json(sermons);
+  } catch {
+    res.status(500).json({ error: "Error loading sermons" });
+  }
+});
+
+app.post("/api/sermons", async (req, res) => {
+  try {
+    const { title, preacher, date, youtube } = req.body;
+
+    const sermons = await loadBin(SERMONS_BIN);
 
     const newSermon = {
       id: Date.now().toString(),
-      title: req.body.title,
-      preacher: req.body.preacher,
-      date: req.body.date,
-      youtube_url: req.body.youtube_url
+      title,
+      preacher,
+      date,
+      youtube
     };
 
-    data.sermons.push(newSermon);
+    sermons.push(newSermon);
+    await saveBin(SERMONS_BIN, sermons);
 
-    await updateBin(SERMONS_BIN, data);
-
-    res.json({ success: true, sermon: newSermon });
-
-  } catch (err) {
-    res.status(500).json({ error: "Failed to save sermon", details: err.message });
+    res.json(newSermon);
+  } catch {
+    res.status(500).json({ error: "Failed to save sermon" });
   }
 });
 
-app.put("/sermons/:id", async (req, res) => {
-  const data = await getBin(SERMONS_BIN);
+app.put("/api/sermons/:id", async (req, res) => {
+  try {
+    const sermons = await loadBin(SERMONS_BIN);
+    const id = req.params.id;
 
-  const sermon = data.sermons.find(s => s.id === req.params.id);
-  if (!sermon) return res.status(404).json({ error: "Not found" });
+    const updated = sermons.map(s =>
+      s.id === id ? { ...s, ...req.body } : s
+    );
 
-  sermon.title = req.body.title;
-  sermon.preacher = req.body.preacher;
-  sermon.date = req.body.date;
-  sermon.youtube_url = req.body.youtube_url;
-
-  await updateBin(SERMONS_BIN, data);
-
-  res.json({ success: true, sermon });
+    await saveBin(SERMONS_BIN, updated);
+    res.json({ message: "Sermon updated" });
+  } catch {
+    res.status(500).json({ error: "Failed to update sermon" });
+  }
 });
 
-app.delete("/sermons/:id", async (req, res) => {
-  const data = await getBin(SERMONS_BIN);
-  data.sermons = data.sermons.filter(s => s.id !== req.params.id);
-
-  await updateBin(SERMONS_BIN, data);
-
-  res.json({ success: true });
+app.delete("/api/sermons/:id", async (req, res) => {
+  try {
+    const sermons = await loadBin(SERMONS_BIN);
+    const filtered = sermons.filter(s => s.id !== req.params.id);
+    await saveBin(SERMONS_BIN, filtered);
+    res.json({ message: "Sermon deleted" });
+  } catch {
+    res.status(500).json({ error: "Failed to delete sermon" });
+  }
 });
 
-// --------------------------
-// SERVER
-// --------------------------
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+// -----------------------------------------------------
+
+app.get("/", (req, res) => {
+  res.json({ status: "Backend running fine." });
+});
+
+app.listen(process.env.PORT, () =>
+  console.log(`Server running on port ${process.env.PORT}`)
+);
