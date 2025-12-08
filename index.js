@@ -7,7 +7,16 @@ import { v2 as cloudinary } from "cloudinary";
 dotenv.config();
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "http://localhost:5173",
+      "https://elimkenya.org",
+      "https://frontend-1-self.vercel.app"
+    ]
+  })
+);
+
 app.use(express.json({ limit: "15mb" })); // supports image uploads
 
 // Cloudinary config
@@ -213,3 +222,4 @@ app.get("/", (req, res) => {
 app.listen(process.env.PORT, () =>
   console.log(`Server running on port ${process.env.PORT}`)
 );
+
